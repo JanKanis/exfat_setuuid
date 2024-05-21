@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 
 import sys, re
-from camel_converter import to_snake
+from camel_converter import to_snake, to_pascal
+from humanize import naturalsize
 
 
 
@@ -18,6 +19,9 @@ UUID_OFFSET = 0x100		# relative to start of VBR
 CHECKSUM_OFFSET = 11*SECTOR_SIZE    # relative to start of VBR
 CHECKSUMMED_DATA_LENGTH = CHECKSUM_OFFSET
 
+FILE_SYSTEM_NAME = b'EXFAT   '  # mind the spaces
+BOOT_SIGNATURE = 0xaa55
+
 
 
 UUID = "ABCD-EFGH"
@@ -31,102 +35,71 @@ def get_uuid_bytes(uuid_str):
 	bytes_str = [uuid_str[7:9], uuid_str[5:7], uuid_str[2:4], uuid_str[0:2]]
 	return bytes(int(x, 16) for x in bytes_str)
 
+def uuid_str(uuid_num):
+	b1, b2, b3, b4 = (format(b, 'X') for b in reversed(uuid_num.to_bytes(4, byteorder='little')))
+	return f"{b1+b2}-{b3+b4}"
+
 
 class ExFatFS:
 	def __init__(self, file):
 		self.file = file
-		pass
-	
+		self.vbr = VBR(self.file, VBR_OFFSET)
+		self.backup_vbr = VBR(self.file, BACKUP_VBR_OFFSET, is_backup=True)
 
-	def write_uuid(uuid, file, vbr_offset):
-		file.seek(vbr_offset+UUID_OFFSET)
-		file.write(uuid)
-	
-	def get_checksum(vbr_offset, is_backup_vbr=False):
-		file.seek(vbr_offset+CHECKSUM_OFFSET)
-		checksum_block = file.read(SECTOR_SIZE)
-		checksum_bytes = checksum_block[0:4]
-		if not checksum_block == checksum_bytes * (SECTOR_SIZE//4):
-			print(f"Checksum block of {'backup ' if is_backup_vbr else ''}volume boot record is corrupt. Expecting a repetition of the checksum value, found {checksum_block}",
-						file=sys.stderr)
-			sys.exit(1)
-		return int.from_bytes(checksum_bytes, byteorder='little')
-	
-	def calc_checksum(vbr_offset):
-		file.seek(vbr_offset)
-		data = file.read(CHECKSUMMED_DATA_LENGTH)
+	def write_uuid(self, uuid, vbr_offset):
+		self.vbr.write_uuid(uuid)
+		self.backup_vbr.write_uuid(uuid)
 		
-		checksum = 0
-		for i, byte in enumerate(data):
-			if i in (106, 107, 112):
-				continue
-			checksum = (0x80000000 if (checksum & 1) else 0) + (checksum >> 1) + byte
-			checksum &= 0xffffffff
-		return checksum
-	
-	def check_vbr(file, vbr_offset, is_backup_vbr=False):
-		file.seek(vbr_offset+3)
-		fsname = file.read(61)
+	def check(self):
+		self.vbr.check()
+		self.backup_vbr.check()
+
+
+
+class VBR:
+
+	fields = dict(
+	  # name (as in spec)         offset   unit    size (bytes, default 4)
+		PartitionOffset =             (64,  'sectors', 8),
+		VolumeLength =                (72,  'sectors', 	8),
+		FatOffset =                   (80,  'sectors'),
+		FatLength =                   (84,  'sectors'),
+		ClusterHeapOffset =           (88,  'sectors'),
+		ClusterCount =                (92,  'clusters'),
+		FirstClusterOfRootDirectory = (96,  'clusters'),
+		VolumeSerialNumber =          (100, 'uuid'),
+		FileSystemRevision =          (104, 'bytes', 2),
+		VolumeFlags =                 (106, 'number', 2),
+		BytesPerSectorShift =         (108, 'log2', 1),
+		SectorsPerClusterShift =      (109, 'log2', 1),
+		NumberOfFats =                (110, 'number', 1),
+		DriveSelect =                 (111, 'number', 1),
+		PercentInUse =                (112, 'number', 1),
+		BootSignature =               (510, '', 2),
+	)
 		
-		file.seek(vbr_offset+510)
-		boot_sig = file.read(2)
+	def __init__(self, file, offset, is_backup=False):
+		self.vbr_fields = []
 
-		if fsname != b'EXFAT   '+b'\x00'*53 or boot_sig != b'\x55\xaa':
-			print(f"Invalid EXFAT {'backup ' if is_backup_vbr else ''}volume boot record. Found fsname {fsname}, boot signature {boot_sig}",
-						file=sys.stderr)
-			sys.exit(1)
+		self.file = file
+		self.offset = offset
+		self.is_backup = is_backup
 		
-		checksum = get_checksum(vbr_offset, is_backup_vbr)
-		expected_checksum = calc_checksum(vbr_offset)
-		if checksum != expected_checksum:
-			print(f"Invalid checksum for {'backup ' if is_backup_vbr else ''}volume boot record. Expected {expected_checksum:x}, found {checksum:x}",
-						file=sys.stderr)
-			sys.exit(1)
-	
-
-class FSInfo:
-
-	fields = [
-	  # name (as in spec)          offset   unit    size (bytes, default 4)
-		('PartitionOffset',             64,  'bytes', 8),
-		('VolumeLength',                72,  'bytes', 	8),
-		('FatOffset',                   80,  'sectors'),
-		('FatLength',                   84,  'sectors'),
-		('ClusterHeapOffset',           88,  'number'),
-		('ClusterCount',                92,  'number'),
-		('FirstClusterOfRootDirectory', 96,  'clusters'),
-		('VolumeSerialNumber',          100, 'number'),
-		('FileSystemRevision',          104, 'bytes', 2),
-		('VolumeFlags',                 106, 'number', 2),
-		('BytesPerSectorShift',         108, 'log2', 1),
-		('SectorsPerClusterShift',      109, 'log2', 1),
-		('NumberOfFats',                110, 'number', 1),
-		('DriveSelect',                 111, 'number', 1),
-		('PercentInUse',                112, 'number', 1),
-		('BootSignature',               510, '', 2),
-	]
-	
-	
-	def __init__(self, file):
-		file.seek(VBR_OFFSET)
+		self.file.seek(offset)
 		self.vbr = file.read(512)
+		
 		self.file_system_name = self.vbr[3:3+8]
-		self._readfields()		
-		
-		#self.partition_offset = self._read(64, 8)
-		#self.volume_length = self._read(72, 8)
-		#self.fat_offset = self._read(80)
-		#self.fat_length = self._read(84)
-		#self.cluster_heap_offset = self._read(88)
-		#self.
-		
+		self._readfields()
+
+
 	def _read(self, offset, length=4):
 		return int.from_bytes(self.vbr[offset:offset+length], byteorder='little')
 		
+
 	def _readfields(self):
-		sectorfields, clusterfields = ([], [])
-		for f in self.fields:
-			name, offset, unit, *size = f
+		sectorfields = []
+		for name, desc in self.fields.items():
+			offset, unit, *size = desc
 			if len(size) > 1:
 				raise AssertionError("more than 4 values in field spec")
 			if len(size):
@@ -138,41 +111,101 @@ class FSInfo:
 			value = self._read(offset, size)
 			if unit == 'sectors':
 				sectorfields.append(fieldname)
-			elif unit == 'clusters':
-				clusterfields.append(fieldname)
-			
+
 			setattr(self, fieldname, value)
-		
+			self.vbr_fields.append(fieldname)
+
 		self.bytes_per_sector = 2**self.bytes_per_sector_shift
 		self.bytes_per_cluster = self.bytes_per_sector * 2**self.sectors_per_cluster_shift
-		
+		self.vbr_fields.extend(('bytes_per_sector', 'bytes_per_cluster'))
+
 		for fieldname in sectorfields:
-			setattr(self, fieldname+'_bytes', getattr(self, fieldname) * self.bytes_per_sector)
-			
-		for fieldname in clusterfields:
-			setattr(self, fieldname+'_bytes', getattr(self, fieldname) * self.bytes_per_cluster)
-	
-	def check(self, is_backup=False):
-		
-	
+			f = fieldname+'_bytes'
+			setattr(self, f, getattr(self, fieldname) * self.bytes_per_sector)
+			self.vbr_fields.append(f)
+
+		self.cluster_heap_length_bytes = self.cluster_count * self.bytes_per_cluster
+		self.vbr_fields.append('cluster_heap_length_bytes')
+
+
+	def get_checksum(self):
+		self.file.seek(self.offset+CHECKSUM_OFFSET)
+		checksum_block = file.read(SECTOR_SIZE)
+		checksum_bytes = checksum_block[0:4]
+		if not checksum_block == checksum_bytes * (SECTOR_SIZE//4):
+			raise InconsistentExFatException(f"Checksum block of {'backup ' if self.is_backup else ''}volume boot record is corrupt. Expecting a repetition of the checksum value, found {checksum_block}")
+		return int.from_bytes(checksum_bytes, byteorder='little')
+
+
+	def calc_checksum(self):
+		self.file.seek(self.offset)
+		data = self.file.read(CHECKSUMMED_DATA_LENGTH)
+
+		checksum = 0
+		for i, byte in enumerate(data):
+			if i in (106, 107, 112):
+				continue
+			checksum = (0x80000000 if (checksum & 1) else 0) + (checksum >> 1) + byte
+			checksum &= 0xffffffff
+		return checksum
+
+
+	def check(self):
+		self.file.seek(self.offset+11)
+		must_be_zero = self.file.read(53)
+
+		file.seek(self.offset+510)
+		boot_sig = file.read(2)
+
+		if self.file_system_name != FILE_SYSTEM_NAME:
+			raise InconsistentExFatException(f"Invalid EXFAT filesystem name in {self._backup_str()}volume boot record. Found {self.file_system_name}, expected {FILE_SYSTEM_NAME}")
+
+		if must_be_zero != b'\x00'*53:
+			raise InconsistentExFatException(f"Invalid EXFAT filesystem: MustBeZero field in {self._backup_str()}volume boot record is not all zeros. Found {must_be_zero}")
+
+		if self.boot_signature != BOOT_SIGNATURE:
+			raise InconsistentExFatException(f"Invalid EXFAT filesystem: boot signature in {self._backup_str()}volume boot record is not 0x{BOOT_SIGNATURE:x}. Found 0x{self.boot_signature:x}.")
+
+		checksum = self.get_checksum()
+		expected_checksum = self.calc_checksum()
+		if checksum != expected_checksum:
+			raise InconsistentExFatException(f"Invalid checksum for {self._backup_str()}volume boot record: expected {expected_checksum:x}, found {checksum:x}")
+
+
+	def write_uuid(self, uuid):
+		self.file.seek(self.offset+UUID_OFFSET)
+		self.file.write(uuid)
+
+
+	def _backup_str(self):
+		return 'backup ' if self.is_backup else ''
+
+
 	def __str__(self):
 		s = "FSInfo:\n"
-		for k, v in self.__dict__.items():
-			if k == 'vbr':
-				continue
-			s += f"  {k}: {v}\n"
-		return s
-			
-				
-		
+		for f in self.vbr_fields:
+			unit = self.fields.get(to_pascal(f), (None,None))[1]
+			val = getattr(self, f)
 
-	
-	
-file = open('testdisk', 'rb+')
-check_vbr(file, VBR_OFFSET)
-check_vbr(file, BACKUP_VBR_OFFSET, is_backup_vbr=True)
-fsinfo = FSInfo(file)
-print(fsinfo)
+			s += f"  {f}: "
+			if unit == 'uuid':
+				s += uuid_str(val)
+			elif unit is None:
+				s += f"{val} ({naturalsize(val, binary=True)})"
+			else:
+				s += str(val)
+			s += "\n"
+		return s
+
+
+class InconsistentExFatException(Exception):
+	pass
+
+
+file = open(sys.argv[1], 'rb+')
+fs = ExFatFS(file)
+fs.check()
+print(fs.vbr)
 
 print('Done')
 
