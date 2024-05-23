@@ -150,7 +150,7 @@ class FS_tests(unittest.TestCase):
 
     def test_not_matching_vbrs(self):
         self.file = MemFS(self.img.read())
-        offset = VBR.fields['FatOffset'].offset
+        offset = VBR.fields['fat_offset'].offset
         self.file.getbuffer()[offset:offset+4] = (35).to_bytes(4, byteorder='little')
         fs = ExFatFS(self.file)
         fs.check()
@@ -162,6 +162,8 @@ class FS_tests(unittest.TestCase):
 
 
 class MemFS(io.BytesIO):
+
+    # Cannot mock io.BytesIO.fileno() because it BytesIO is immutable and implemented in C
     def fileno(self):
         return "foobar"
 

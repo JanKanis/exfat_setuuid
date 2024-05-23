@@ -3,8 +3,12 @@
 import sys, os, re, argparse, pathlib, subprocess, weakref
 from collections import namedtuple
 
-from camel_converter import to_snake, to_pascal
-from humanfriendly import parse_size, format_size
+try:
+	from humanfriendly import parse_size, format_size
+except ImportError:
+	def parse_size(num, binary=False):
+		return int(num)
+	format_size = None
 
 
 
@@ -66,11 +70,10 @@ class ExFatFS:
 		self.vbr.check()
 		self.backup_vbr.check()
 		for field, desc in VBR.fields.items():
-			if field in {'VolumeFlags', 'PercentInUse'}:
+			if field in {'volume_flags', 'percent_in_use'}:
 				continue
-			f = to_snake(field)
-			if not getattr(self.vbr, f) == getattr(self.backup_vbr, f):
-				self.inconsistentFS(f"Invalid EXFAT filesystem: {field} in VBR does not equal {field} in backup VBR. Found {VBR.format_value(getattr(self.vbr, f), desc[1])} and {VBR.format_value(getattr(self.backup_vbr, f), desc[1])}")
+			if not getattr(self.vbr, field) == getattr(self.backup_vbr, field):
+				self.inconsistentFS(f"Invalid EXFAT filesystem: {field} in VBR does not equal {field} in backup VBR. Found {VBR.format_value(getattr(self.vbr, field), desc[1])} and {VBR.format_value(getattr(self.backup_vbr, field), desc[1])}")
 
 
 	def inconsistentFS(self, message):
@@ -83,32 +86,32 @@ D = Desc = namedtuple('Desc', 'offset unit size', defaults=[4])
 class VBR:
 
 	fields = dict(
-		# name (as in spec)          offset   unit      size (bytes, default 4)
-		PartitionOffset =             D(64,  'sectors', 8),
-		VolumeLength =                D(72,  'sectors', 8),
-		FatOffset =                   D(80,  'sectors'),
-		FatLength =                   D(84,  'sectors'),
-		ClusterHeapOffset =           D(88,  'sectors'),
-		ClusterCount =                D(92,  'clusters'),
-		FirstClusterOfRootDirectory = D(96,  'clusters'),
-		VolumeSerialNumber =          D(100, 'uuid'),
-		FileSystemRevision =          D(104, 'version', 2),
-		VolumeFlags =                 D(106, 'flags', 2),
-		BytesPerSectorShift =         D(108, 'log2', 1),
-		SectorsPerClusterShift =      D(109, 'log2', 1),
-		NumberOfFats =                D(110, 'number', 1),
-		DriveSelect =                 D(111, 'number', 1),
-		PercentInUse =                D(112, 'number', 1),
-		BootSignature =               D(510, 'hex', 2),
+		# name (as in spec)              offset   unit      size (bytes, default 4)
+		partition_offset =                D(64,  'sectors', 8),
+		volume_length =                   D(72,  'sectors', 8),
+		fat_offset =                      D(80,  'sectors'),
+		fat_length =                      D(84,  'sectors'),
+		cluster_heap_offset =             D(88,  'sectors'),
+		cluster_count =                   D(92,  'clusters'),
+		first_cluster_of_root_directory = D(96,  'clusters'),
+		volume_serial_number =            D(100, 'uuid'),
+		file_system_revision =            D(104, 'version', 2),
+		volume_flags =                    D(106, 'flags', 2),
+		bytes_per_sector_shift =          D(108, 'log2', 1),
+		sectors_per_cluster_shift =       D(109, 'log2', 1),
+		number_of_fats =                  D(110, 'number', 1),
+		drive_select =                    D(111, 'number', 1),
+		percent_in_use =                  D(112, 'number', 1),
+		boot_signature =                  D(510, 'hex', 2),
 	)
 	
 	calculated_fields = dict(
 		**fields,
-		Checksum = D(None, 'hex'),
-		BytesPerSector = D(None, 'bytes'),
-		BytesPerCluster = D(None, 'bytes'),
-		**{k+'Bytes': D(None, 'bytes') for k, v in fields.items() if v[1] == 'sectors'},
-		ClusterHeapLengthBytes = D(None, 'bytes'),
+		checksum = D(None, 'hex'),
+		bytes_per_sector = D(None, 'bytes'),
+		bytes_per_cluster = D(None, 'bytes'),
+		**{k+'_bytes': D(None, 'bytes') for k, v in fields.items() if v[1] == 'sectors'},
+		cluster_heap_length_bytes = D(None, 'bytes'),
 	)
 
 
@@ -139,12 +142,11 @@ class VBR:
 		for name, desc in self.fields.items():
 			offset, unit, size = desc
 
-			fieldname = to_snake(name)
 			value = self._read(offset, size)
 			if unit == 'sectors':
-				sectorfields.append(fieldname)
+				sectorfields.append(name)
 
-			setattr(self, fieldname, value)
+			setattr(self, name, value)
 
 		self.bytes_per_sector = 2**self.bytes_per_sector_shift
 		self.bytes_per_cluster = self.bytes_per_sector * 2**self.sectors_per_cluster_shift
@@ -194,9 +196,6 @@ class VBR:
 		self.file.seek(self.offset+11)
 		must_be_zero = self.file.read(53)
 
-		self.file.seek(self.offset+510)
-		boot_sig = self.file.read(2)
-
 		if self.file_system_name != FILE_SYSTEM_NAME:
 			self.inconsistentFS(f"Invalid EXFAT filesystem: name in {self._backup_str()}volume boot record. Found {self.file_system_name}, expected {FILE_SYSTEM_NAME}")
 
@@ -216,7 +215,7 @@ class VBR:
 
 
 	def base_write_uuid(self, uuid):
-		self.file.seek(self.offset+self.fields['VolumeSerialNumber'].offset)
+		self.file.seek(self.offset+self.fields['volume_serial_number'].offset)
 		self.file.write(uuid)
 
 
@@ -236,9 +235,8 @@ class VBR:
 	def __str__(self):
 		s = "FSInfo:\n"
 		for name, desc in self.calculated_fields.items():
-			f = to_snake(name)
-			val = getattr(self, f)
-			s += f"  {f}: {self.format_value(val, desc.unit)}\n"
+			val = getattr(self, name)
+			s += f"  {name}: {self.format_value(val, desc.unit)}\n"
 		return s
 
 
@@ -252,7 +250,7 @@ class VBR:
 			return f"{val//256}.{val%256}"
 		if unit == 'flags':
 			return ','.join(name for name, flag in (('ActiveFat', 1), ('VolumeDirty', 2), ('MediaFailure', 4), ('ClearToZero', 8), (f'Reserved=0x{val&0xfff0:X}', 0xfff0)) if flag&val) or '(none)'
-		if unit == 'bytes':
+		if unit == 'bytes' and format_size:
 			return f"{val} ({format_size(val, binary=True)})"
 		return str(val)		
 
@@ -266,7 +264,7 @@ def main():
 	argp = argparse.ArgumentParser(description="This program shows low level configuration of an ExFat filesystem and checks the volume boot record (superblock) for consistecy. It also allows setting the UUID/serial number. Without options, will check consistency and show configuration.")
 	argp.add_argument('device', type=pathlib.Path, help="The device file to use.")
 	argp.add_argument('--write-uuid', dest='uuid', type=get_uuid_bytes, help="Write this UUID (serial number) to the filesystem superblock. Before writing, the program will verify the consistency of the filesystem superblock. WARNING: There should NEVER be more than one active filesystem with the same UUID on your system. This should only be used if you are replacing an old ExFat filesystem!")
-	argp.add_argument('--read-device-sector-size', action='store_true', help='Use device block size')
+	argp.add_argument('--read-device-sector-size', action='store_true', help='Use device block size (does not work on image files; this requires the `blockdev` program)')
 	argp.add_argument('--sector-size', '-b', default=None, type=lambda x: parse_size(x, binary=True), help='The sector size of the file system. K-suffix is supported. If omitted, will read sector size from filesystem superblock.')
 	argp.add_argument('--ignore-invalid', action='store_true', help='Report configuration even if filesystem is corrupt')
 	args = argp.parse_args()
