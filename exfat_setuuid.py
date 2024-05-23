@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
-import sys, re, argparse, pathlib, subprocess, weakref
+import sys, os, re, argparse, pathlib, subprocess, weakref
+from collections import namedtuple
+
 from camel_converter import to_snake, to_pascal
 from humanfriendly import parse_size, format_size
 
@@ -9,8 +11,6 @@ from humanfriendly import parse_size, format_size
 DEFAULT_BLOCK_SIZE = 512
 
 # Volume Boot Record / Volume Boot Region
-VBR_OFFSET = 0
-
 BACKUP_VBR_OFFSET = 12
 
 CHECKSUM_OFFSET = 11    # no. of sectors relative to start of VBR
@@ -40,22 +40,24 @@ def try_get_block_size(device):
 			return int(p.stdout)
 		else:
 			print("Unable to determine device block size, defaulting to 512: "+p.stderr)
-			return DEFAULT_BLOCK_SIZE
+			return None
 	except (FileNotFoundError, ValueError):
-		return DEFAULT_BLOCK_SIZE
+		return None
 
 
 class ExFatFS:
-	def __init__(self, file, sector_size=512):
+	def __init__(self, file, sector_size=None):
 		self.inconsistent = False
 		self.file = file
-		self.vbr = VBR(self.file, VBR_OFFSET*sector_size, self, sector_size=sector_size)
+		self.vbr = VBR(self.file, 0, self, sector_size=sector_size)
+		if sector_size is None:
+			sector_size = self.vbr.sector_size
 		self.backup_vbr = VBR(self.file, BACKUP_VBR_OFFSET*sector_size, self, sector_size=sector_size, is_backup=True)
 
 	def set_uuid(self, uuid):
 		self.vbr.set_uuid(uuid)
 		self.file.flush()
-		os.fsync(self.file.fileno())
+		os.fsync(self.file.fileno())  # Update main and backup VBR one by one for recoverability
 		self.backup_vbr.set_uuid(uuid)
 		self.file.flush()
 		os.fsync(self.file.fileno())
@@ -63,6 +65,12 @@ class ExFatFS:
 	def check(self):
 		self.vbr.check()
 		self.backup_vbr.check()
+		for field, desc in VBR.fields.items():
+			if field in {'VolumeFlags', 'PercentInUse'}:
+				continue
+			f = to_snake(field)
+			if not getattr(self.vbr, f) == getattr(self.backup_vbr, f):
+				self.inconsistentFS(f"Invalid EXFAT filesystem: {field} in VBR does not equal {field} in backup VBR. Found {VBR.format_value(getattr(self.vbr, f), desc[1])} and {VBR.format_value(getattr(self.backup_vbr, f), desc[1])}")
 
 
 	def inconsistentFS(self, message):
@@ -71,45 +79,40 @@ class ExFatFS:
 
 
 
+D = Desc = namedtuple('Desc', 'offset unit size', defaults=[4])
 class VBR:
 
 	fields = dict(
-	  # name (as in spec)         offset   unit    size (bytes, default 4)
-		PartitionOffset =             (64,  'sectors', 8),
-		VolumeLength =                (72,  'sectors', 	8),
-		FatOffset =                   (80,  'sectors'),
-		FatLength =                   (84,  'sectors'),
-		ClusterHeapOffset =           (88,  'sectors'),
-		ClusterCount =                (92,  'clusters'),
-		FirstClusterOfRootDirectory = (96,  'clusters'),
-		VolumeSerialNumber =          (100, 'uuid'),
-		FileSystemRevision =          (104, 'version', 2),
-		VolumeFlags =                 (106, 'flags', 2),
-		BytesPerSectorShift =         (108, 'log2', 1),
-		SectorsPerClusterShift =      (109, 'log2', 1),
-		NumberOfFats =                (110, 'number', 1),
-		DriveSelect =                 (111, 'number', 1),
-		PercentInUse =                (112, 'number', 1),
-		BootSignature =               (510, 'hex', 2),
+		# name (as in spec)          offset   unit      size (bytes, default 4)
+		PartitionOffset =             D(64,  'sectors', 8),
+		VolumeLength =                D(72,  'sectors', 8),
+		FatOffset =                   D(80,  'sectors'),
+		FatLength =                   D(84,  'sectors'),
+		ClusterHeapOffset =           D(88,  'sectors'),
+		ClusterCount =                D(92,  'clusters'),
+		FirstClusterOfRootDirectory = D(96,  'clusters'),
+		VolumeSerialNumber =          D(100, 'uuid'),
+		FileSystemRevision =          D(104, 'version', 2),
+		VolumeFlags =                 D(106, 'flags', 2),
+		BytesPerSectorShift =         D(108, 'log2', 1),
+		SectorsPerClusterShift =      D(109, 'log2', 1),
+		NumberOfFats =                D(110, 'number', 1),
+		DriveSelect =                 D(111, 'number', 1),
+		PercentInUse =                D(112, 'number', 1),
+		BootSignature =               D(510, 'hex', 2),
 	)
 	
 	calculated_fields = dict(
 		**fields,
-		Checksum = (None, 'hex'),
-		BytesPerSector = (None, 'bytes'),
-		BytesPerCluster = (None, 'bytes'),
-		**{k+'Bytes': (None, 'bytes') for k, v in fields.items() if v[1] == 'sectors'},
-		ClusterHeapLengthBytes = (None, 'bytes'),
+		Checksum = D(None, 'hex'),
+		BytesPerSector = D(None, 'bytes'),
+		BytesPerCluster = D(None, 'bytes'),
+		**{k+'Bytes': D(None, 'bytes') for k, v in fields.items() if v[1] == 'sectors'},
+		ClusterHeapLengthBytes = D(None, 'bytes'),
 	)
-	
-	
-	#vbr_fields = [to_snake(k) for k in fields.keys()]\
-	# + [to_snake(k)+'_bytes' for k, v in fields.items() if v[1] == 'sectors']\
-	# + ['checksum', 'bytes_per_sector', 'bytes_per_cluster', 'cluster_heap_length_bytes']
-	#hex_fields = ['checksum']
 
 
-	def __init__(self, file, offset, exfatfs, sector_size=512, is_backup=False):
+	def __init__(self, file, offset, exfatfs, sector_size=None, is_backup=False):
 		self.file = file
 		self.offset = offset
 		self.exfatfs = weakref.ref(exfatfs)
@@ -134,13 +137,7 @@ class VBR:
 	def _readfields(self):
 		sectorfields = []
 		for name, desc in self.fields.items():
-			offset, unit, *size = desc
-			if len(size) > 1:
-				raise AssertionError("more than 4 values in field spec")
-			if len(size):
-				size = size[0]
-			else:
-				size = 4
+			offset, unit, size = desc
 
 			fieldname = to_snake(name)
 			value = self._read(offset, size)
@@ -148,29 +145,21 @@ class VBR:
 				sectorfields.append(fieldname)
 
 			setattr(self, fieldname, value)
-			#self.vbr_fields.append(fieldname)
-
-		#sectorsize = 2**self.bytes_per_sector_shift
-		#self.file.seek(self.offset + 11*sectorsize)
-		#self.checksum = int.from_bytes(self.file.read(4), byteorder='little')
-		#self.hex_fields.append('checksum')
-		#self.vbr_fields.append('checksum')
 
 		self.bytes_per_sector = 2**self.bytes_per_sector_shift
 		self.bytes_per_cluster = self.bytes_per_sector * 2**self.sectors_per_cluster_shift
-		#self.vbr_fields.extend(('bytes_per_sector', 'bytes_per_cluster'))
-		
+
+		if self.sector_size is None:
+			self.sector_size = self.bytes_per_sector
+			print(f"Using filesystem reported sector size of {self.sector_size} bytes", file=sys.stderr)
+
 		self.checksum = self.get_checksum(report_bad=False)
-		#self.hex_fields.append('checksum')
-		#self.vbr_fields.append('checksum')
 
 		for fieldname in sectorfields:
 			f = fieldname+'_bytes'
 			setattr(self, f, getattr(self, fieldname) * self.bytes_per_sector)
-			#self.vbr_fields.append(f)
 
 		self.cluster_heap_length_bytes = self.cluster_count * self.bytes_per_cluster
-		#self.vbr_fields.append('cluster_heap_length_bytes')
 
 
 	def get_checksum(self, report_bad=True):
@@ -196,7 +185,7 @@ class VBR:
 
 
 	def write_checksum(self):
-		checksum_sector = self.get_checksum().to_bytes(4, byteorder='little') * (self.sector_size//4)
+		checksum_sector = self.calc_checksum().to_bytes(4, byteorder='little') * (self.sector_size//4)
 		self.file.seek(self.offset + self.sector_size*CHECKSUM_OFFSET)
 		self.file.write(checksum_sector)
 
@@ -227,7 +216,7 @@ class VBR:
 
 
 	def base_write_uuid(self, uuid):
-		self.file.seek(self.offset+self.fields['VolumeSerialNumber'][0])
+		self.file.seek(self.offset+self.fields['VolumeSerialNumber'].offset)
 		self.file.write(uuid)
 
 
@@ -247,10 +236,9 @@ class VBR:
 	def __str__(self):
 		s = "FSInfo:\n"
 		for name, desc in self.calculated_fields.items():
-			unit = desc[1]
 			f = to_snake(name)
 			val = getattr(self, f)
-			s += f"  {f}: {self.format_value(val, unit)}\n"
+			s += f"  {f}: {self.format_value(val, desc.unit)}\n"
 		return s
 
 
@@ -278,31 +266,31 @@ def main():
 	argp = argparse.ArgumentParser(description="This program shows low level configuration of an ExFat filesystem and checks the volume boot record (superblock) for consistecy. It also allows setting the UUID/serial number. Without options, will check consistency and show configuration.")
 	argp.add_argument('device', type=pathlib.Path, help="The device file to use.")
 	argp.add_argument('--write-uuid', dest='uuid', type=get_uuid_bytes, help="Write this UUID (serial number) to the filesystem superblock. Before writing, the program will verify the consistency of the filesystem superblock. WARNING: There should NEVER be more than one active filesystem with the same UUID on your system. This should only be used if you are replacing an old ExFat filesystem!")
-	argp.add_argument('--autodetect-sector-size', action='store_true', help='Use device block size')
-	argp.add_argument('--sector-size', default=None, type=lambda x: parse_size(x, binary=True), help='The sector size of the medium (defaults to 512 bytes). K-suffix is supported.')
+	argp.add_argument('--read-device-sector-size', action='store_true', help='Use device block size')
+	argp.add_argument('--sector-size', '-b', default=None, type=lambda x: parse_size(x, binary=True), help='The sector size of the file system. K-suffix is supported. If omitted, will read sector size from filesystem superblock.')
 	argp.add_argument('--ignore-invalid', action='store_true', help='Report configuration even if filesystem is corrupt')
 	args = argp.parse_args()
-	print(args)
 
 	mode = 'rb' if args.uuid is None else 'rb+'
 	with open(args.device, mode) as file:
-		if args.sector_size is None and args.autodetect_sector_size:
+		if args.sector_size is None and args.read_device_sector_size:
 			args.sector_size = try_get_block_size(args.device)
-		if args.sector_size is None:
-			args.sector_size = DEFAULT_BLOCK_SIZE
-		print(args)
 
 		fs = ExFatFS(file, sector_size=args.sector_size)
 		fs.check()
 		if fs.inconsistent:
-			print(f"Not an ExFat filesystem or filesystem is corrupted. Did you specify the right block size? (using: {args.sector_size})", file=sys.stderr)
-		if not fs.inconsistent or args.ignore_invalid:
+			print(f"Error: Not an ExFat filesystem or filesystem is corrupted.", file=sys.stderr)
+			if not args.ignore_invalid:
+				sys.exit(1)
+
+		if not args.uuid:
 			print(fs.vbr)
-		
-		if fs.inconsistent and not args.ignore_invalid:
-			sys.exit(1)
+
+		if not fs.inconsistent and args.uuid:
+			fs.set_uuid(args.uuid)
+			fs.check()
+			print(f"Updated UUID to {uuid_str(int.from_bytes(args.uuid, byteorder='little'))}")
 
 
 if __name__ == '__main__':
 	main()
-
