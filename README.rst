@@ -40,3 +40,9 @@ Other usage information::
       --sector-size SECTOR_SIZE, -b SECTOR_SIZE
                             The sector size of the file system. K-suffix is supported. If omitted, will read sector size from filesystem superblock.
       --ignore-invalid      Report configuration even if filesystem is corrupt
+
+
+Alternatives
+------------
+
+On Linux, the programs `exfatlabel` and `tune.exfat` (part of `exfatprogs`) can also edit the serial number/UUID.
